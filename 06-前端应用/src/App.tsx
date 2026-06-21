@@ -3,6 +3,7 @@ import Leaderboard from './components/Leaderboard'
 import RaceHeader from './components/RaceHeader'
 import StintPanel from './components/StintPanel'
 import ConnectPanel from './components/ConnectPanel'
+import ResultsView, { ResultData } from './components/ResultsView'
 
 export interface RaceItem {
   id: number
@@ -47,22 +48,26 @@ export interface StintInfo {
 
 export interface PitInfo {
   lapNumber: number
-  timeOfDay: string         // "13:42:15.123"
-  ri_time_of_day: string    // "2026/5/17 13:42:15"
+  timeOfDay: string
+  ri_time_of_day: string
   lapTm: number
-  pitDurationMs: number
-  pitDurationSec: number
-  belowMin: boolean
 }
 
 export interface PitAnalysis {
   baseLapTm: number
-  pitThreshold: number
   totalLaps: number
+  pitCount: number
+  realPitstops: number | null
   pits: PitInfo[]
   stints: { startLap: number; endLap: number; startTime: string; endTime: string; laps: number }[]
   currentStint: { startLap: number; currentLap: number; startTime: string; lastLapTime: string } | null
   lastPit: PitInfo | null
+}
+
+export interface PitTimer {
+  inPit: boolean
+  enterTime: number | null
+  events: { enterTime: number; exitTime: number; durationMs: number }[]
 }
 
 export interface AccurateDriverData {
@@ -98,10 +103,12 @@ function App() {
   const [controlMessages, setControlMessages] = useState<{ id: number; cont: string; c_time: string }[]>([])
   const [stintTracker, setStintTracker] = useState<Record<string, StintInfo>>({})
   const [pitAnalysis, setPitAnalysis] = useState<PitAnalysis | null>(null)
-  const [pitStatus, setPitStatus] = useState<Record<string, { inPit: boolean; enterTime: number | null }>>({})
-  const [accurateDrivers, setAccurateDrivers] = useState<AccurateDriverData | null>(null)
+  const [pitTimer, setPitTimer] = useState<PitTimer | null>(null)
   const [lapData, setLapData] = useState<Record<string, { laps: number; lapTm: number; ri_time_of_day: string }[]>>({})
   const [trackedTeamId, setTrackedTeamId] = useState<string | null>(null)
+  const [resultData, setResultData] = useState<ResultData | null>(null)
+  const [resultLoading, setResultLoading] = useState(false)
+  const [replay, setReplay] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
 
   const connectWs = useCallback(() => {
@@ -119,8 +126,7 @@ function App() {
         setControlMessages(msg.controlMessages || [])
         setStintTracker(msg.stintTracker || {})
         setPitAnalysis(msg.pitAnalysis || null)
-        if (msg.pitStatus) setPitStatus(msg.pitStatus)
-        setAccurateDrivers(msg.accurateDrivers || null)
+        setPitTimer(msg.pitTimer || null)
         if (msg.lapData) setLapData(msg.lapData)
       }
       if (msg.type === 'status') {
@@ -156,14 +162,36 @@ function App() {
   const stopPolling = () => {
     wsRef.current?.send(JSON.stringify({ type: 'stop_polling' }))
     setPolling(false)
+    setReplay(false)
+  }
+
+  // 开发/回放：加载本地存档并进入看板视图
+  const startReplay = (filename: string) => {
+    fetch('/api/load', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    })
+      .then(r => r.json())
+      .then(res => { if (res.success) setReplay(true) })
   }
 
   const selectTeam = (teamId: string) => {
     setTrackedTeamId(teamId)
-    // 立刻清掉旧车队的进站/车手数据，等待新车队的数据到来
-    setPitAnalysis(null)
-    setAccurateDrivers(null)
+    setPitAnalysis(null)  // 清掉旧车队的棒次数据，等新数据
     wsRef.current?.send(JSON.stringify({ type: 'set_tracked_team', teamId }))
+  }
+
+  // 查看已结束比赛的最终成绩
+  const viewResults = (ssid: string, pid: string, name: string) => {
+    setResultLoading(true)
+    fetch(`/api/result/${ssid}/${pid}`)
+      .then(r => r.json())
+      .then(data => {
+        setResultData({ ...data, sessionName: name })
+      })
+      .catch(() => setResultData({ groups: [], sessionName: name }))
+      .finally(() => setResultLoading(false))
   }
 
   return (
@@ -178,12 +206,23 @@ function App() {
           </div>
         </div>
 
-        {/* Connect / Race Info */}
-        {!polling ? (
-          <ConnectPanel onStart={startPolling} />
+        {/* Connect / Results / Live */}
+        {resultData || resultLoading ? (
+          resultLoading ? (
+            <div className="bg-gray-800 rounded-lg p-8 text-center text-gray-400">加载最终成绩...</div>
+          ) : (
+            <ResultsView data={resultData!} onBack={() => setResultData(null)} />
+          )
+        ) : !polling && !replay ? (
+          <ConnectPanel onStart={startPolling} onViewResults={viewResults} onReplay={startReplay} />
         ) : (
           <>
             <RaceHeader raceInfo={raceInfo} onStop={stopPolling} />
+            {replay && (
+              <div className="bg-indigo-900/30 border border-indigo-700/40 rounded px-3 py-1.5 text-xs text-indigo-300">
+                🔁 回放模式（本地存档，非实时）。点选车队查看其棒次/圈速。
+              </div>
+            )}
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4">
               {/* Left: Leaderboard */}
@@ -198,17 +237,15 @@ function App() {
                 />
               </div>
 
-              {/* Right: Strategy Panel */}
+              {/* Right: Strategy Panel — 仅真实数据 */}
               <div className="space-y-3 sm:space-y-4 order-1 lg:order-2 lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto">
-                {trackedTeamId && stintTracker[trackedTeamId] && (
+                {trackedTeamId && items.find(i => String(i.id) === trackedTeamId) && (
                   <StintPanel
-                    stint={stintTracker[trackedTeamId]}
                     teamItem={items.find(i => String(i.id) === trackedTeamId)}
-                    pitAnalysis={pitAnalysis}
-                    pitStatus={pitStatus[trackedTeamId] || null}
-                    accurateDrivers={accurateDrivers}
                     controlMessages={controlMessages}
                     lapData={trackedTeamId ? lapData[trackedTeamId] : undefined}
+                    pitAnalysis={pitAnalysis}
+                    pitTimer={pitTimer}
                   />
                 )}
               </div>

@@ -95,6 +95,8 @@ function loadSavedState(filepath) {
             state.pid = saved.config.pid;
             state.trackedTeamId = saved.config.trackedTeamId;
         }
+        // 用新版进站识别从真实 lapData 重算 pitAnalysis（兼容旧存档的字段差异）
+        recomputePitAnalysis();
         console.log(`Loaded saved state from ${filepath}`);
         console.log(`  Race: ${state.raceInfo?.ri_name}, Items: ${state.items.length}, Snapshots: ${state.snapshots.length}`);
         return true;
@@ -102,6 +104,16 @@ function loadSavedState(filepath) {
         console.error('Load error:', err.message);
         return false;
     }
+}
+
+/**
+ * 根据当前 trackedTeamId 的 lapData 重算 pitAnalysis（回放/切队时用）
+ */
+function recomputePitAnalysis() {
+    const tid = state.trackedTeamId != null ? String(state.trackedTeamId) : null;
+    if (!tid || !state.lapData[tid]) { state.pitAnalysis = null; return; }
+    const item = state.items.find(i => String(i.id) === tid);
+    state.pitAnalysis = analyzeLapItems(state.lapData[tid], item?.bestTm || 0, item?.pitstops);
 }
 
 /**
@@ -175,6 +187,13 @@ const state = {
 
     // 实时进站状态追踪: { teamId: { inPit: bool, enterTime: ms, lastSt: number } }
     pitStatus: {},
+
+    // 基于 st 跳变的精确进站计时（轮询时刻为准）：
+    // { teamId: { inPit, enterTime, lastSt, events: [{enterTime, exitTime, durationMs}] } }
+    pitTimers: {},
+
+    // 自适应轮询定时器句柄
+    pollTimer: null,
 
     // Driver stint tracking
     stintTracker: {},     // { teamId: { currentDriver, stintStart, stints: [{driver, start, end, duration}], pitStops: [] } }
@@ -378,23 +397,69 @@ function computeAccurateDriverTotals(teamId, pitAnalysis, currentDriver) {
 }
 
 /**
- * 解析 lapItems，识别进站圈并计算精确进站时长
- * 进站圈识别：lapTm 显著高于正常圈速（>1.5倍最快圈 或 >150秒）
- * 返回每次进站的：
- *   - lapNumber: 进站发生在第几圈完成时
- *   - timeOfDay: 进站圈完成时的真实时间
- *   - pitDurationMs: 估算的进站停留时长（lapTm - 平均正常圈速）
- *   - lapTm: 该圈总时长
+ * 解析 lapItems，识别进站圈（基于真实数据 + pitstops 交叉校验）。
+ * 进站圈判据：
+ *   1) 该圈耗时比正常圈多出 ≥ PIT_EXTRA_MS（娱乐车强制停 2 分钟，进站圈必然 +120s 以上）
+ *   2) 排除第 1 圈（起步/暖胎圈，圈速偏高但非进站）
+ *   3) 若已知真实进站次数 pitstops，且候选数 > pitstops，则只保留耗时最大的 N 个
+ *      → 自动排除「赛道事故慢圈 / 暖胎圈 / 全场黄旗」等非进站的高耗时圈
+ * 棒次的圈数、过线时刻、单棒时长全部来自真实 lapItems，无估算。
  */
-function analyzeLapItems(lapItems, bestTm) {
+const PIT_EXTRA_MS = 90000; // 进站圈相对正常圈的最小额外耗时（真进站约 +120~160s）
+
+/**
+ * 基于 st 状态跳变的精确进站计时（以轮询采样时刻为准）。
+ * st >= 2 视为在维修区。进P = st 从 ≤1 升到 ≥2 的时刻；出P = 从 ≥2 回到 ≤1 的时刻。
+ * 精度 = 轮询间隔（选中车队进站时会自动加密到 1 秒）。
+ */
+function trackPitTimers(items, timestamp) {
+    items.forEach(item => {
+        const id = String(item.id);
+        let pt = state.pitTimers[id];
+        if (!pt) {
+            // 首次观察：即使已在维修区，也不假设进P时刻（标 null = 未捕捉到进站瞬间）
+            pt = { inPit: item.st >= 2, enterTime: null, lastSt: item.st, events: [] };
+            state.pitTimers[id] = pt;
+            return;
+        }
+        const wasInPit = pt.lastSt >= 2;
+        const nowInPit = item.st >= 2;
+        if (!wasInPit && nowInPit) {
+            pt.inPit = true;
+            pt.enterTime = timestamp;
+        } else if (wasInPit && !nowInPit) {
+            pt.inPit = false;
+            if (pt.enterTime) {
+                pt.events.push({ enterTime: pt.enterTime, exitTime: timestamp, durationMs: timestamp - pt.enterTime });
+            }
+            pt.enterTime = null;
+        }
+        pt.lastSt = item.st;
+    });
+}
+
+function analyzeLapItems(lapItems, bestTm, pitstops) {
     if (!lapItems || lapItems.length === 0) return null;
 
-    // 计算"正常圈速"基准：用 bestTm 或 取所有圈速中位数较小的部分
+    // 正常圈速基准：用 bestTm，或所有圈速的较低四分位
     const sortedTms = lapItems.map(l => l.lapTm).filter(t => t > 0).sort((a, b) => a - b);
     const baseLapTm = bestTm > 0 ? bestTm : (sortedTms[Math.floor(sortedTms.length / 4)] || 70000);
 
-    // 阈值：正常圈速的 1.6 倍 或 150 秒，取较小值（避免赛道圈速差异）
-    const pitThreshold = Math.min(baseLapTm * 1.6, 150000);
+    // 1) 找候选进站圈：额外耗时 ≥ PIT_EXTRA_MS（不再硬跳第1圈，避免漏掉「第1圈就进站」的队）
+    //    起步暖胎圈通常 < 90s，达不到阈值，自然被排除
+    let candidates = lapItems
+        .map((lap, idx) => ({ lap, idx, extra: lap.lapTm - baseLapTm }))
+        .filter(c => c.extra >= PIT_EXTRA_MS);
+
+    // 2) pitstops 交叉校验：候选多于真实进站次数时，保留额外耗时最大的 N 个
+    const realPits = Number(pitstops);
+    if (Number.isFinite(realPits) && realPits > 0 && candidates.length > realPits) {
+        candidates = [...candidates]
+            .sort((a, b) => b.extra - a.extra)
+            .slice(0, realPits)
+            .sort((a, b) => a.idx - b.idx);
+    }
+    const pitIdxSet = new Set(candidates.map(c => c.idx));
 
     const pits = [];
     const stints = [];
@@ -402,21 +467,15 @@ function analyzeLapItems(lapItems, bestTm) {
     let currentStintStartTime = null;
 
     lapItems.forEach((lap, idx) => {
-        const isPitLap = lap.lapTm > pitThreshold;
-        if (isPitLap) {
-            // 估算进站时长 = 此圈时间 - 一个正常圈速
-            const pitDurationMs = lap.lapTm - baseLapTm;
+        if (idx === 0) currentStintStartTime = lap.ri_time_of_day;
+        if (pitIdxSet.has(idx)) {
             pits.push({
                 lapNumber: lap.laps,
-                timeOfDay: lap.timeOfDay,           // "13:42:15.123"
-                ri_time_of_day: lap.ri_time_of_day, // "2026/5/17 13:42:15"
+                timeOfDay: lap.timeOfDay,
+                ri_time_of_day: lap.ri_time_of_day,
                 lapTm: lap.lapTm,
-                pitDurationMs,
-                pitDurationSec: Math.round(pitDurationMs / 1000),
-                belowMin: pitDurationMs < 120000,
             });
-
-            // 关闭当前 stint
+            // 关闭当前棒
             if (currentStintStartTime) {
                 stints.push({
                     startLap: currentStintStartLap,
@@ -428,14 +487,12 @@ function analyzeLapItems(lapItems, bestTm) {
             }
             currentStintStartLap = lap.laps + 1;
             currentStintStartTime = lap.ri_time_of_day;
-        } else if (idx === 0) {
-            currentStintStartTime = lap.ri_time_of_day;
         }
     });
 
-    // 当前进行中的 stint
+    // 当前进行中的棒
     const lastLap = lapItems[lapItems.length - 1];
-    const currentStint = lastLap && currentStintStartTime ? {
+    const currentStint = lastLap && currentStintStartTime && !pitIdxSet.has(lapItems.length - 1) ? {
         startLap: currentStintStartLap,
         currentLap: lastLap.laps,
         startTime: currentStintStartTime,
@@ -444,8 +501,9 @@ function analyzeLapItems(lapItems, bestTm) {
 
     return {
         baseLapTm,
-        pitThreshold,
-        totalLaps: lapItems.length,
+        totalLaps: lastLap ? lastLap.laps : lapItems.length,
+        pitCount: pits.length,
+        realPitstops: Number.isFinite(realPits) ? realPits : null,
         pits,
         stints,
         currentStint,
@@ -486,7 +544,7 @@ async function pollRaceData() {
             const trackedItem = data.items.find(i => i.id == state.trackedTeamId);
             if (trackedItem && trackedItem.lapItems) {
                 state.lapData[state.trackedTeamId] = trackedItem.lapItems;
-                state.pitAnalysis = analyzeLapItems(trackedItem.lapItems, trackedItem.bestTm);
+                state.pitAnalysis = analyzeLapItems(trackedItem.lapItems, trackedItem.bestTm, trackedItem.pitstops);
             }
         }
 
@@ -499,8 +557,10 @@ async function pollRaceData() {
             });
         }
 
-        // 实时追踪所有车队的进站状态
-        // 用 lapItems 的最后一圈 timeOfDay 作为精确进站开始时间
+        // 基于 st 跳变的精确进站计时（所有车队）
+        trackPitTimers(state.items, timestamp);
+
+        // 实时追踪所有车队的进站状态（旧逻辑，保留兼容）
         state.items.forEach(item => {
             const id = String(item.id);
             if (!state.pitStatus[id]) {
@@ -509,18 +569,9 @@ async function pollRaceData() {
             const ps = state.pitStatus[id];
             const nowInPit = item.st >= 2;
             if (nowInPit && !ps.inPit) {
-                // 刚进站: 从 lapItems 获取最后一圈过线时间 = pit lap 起点
                 ps.inPit = true;
-                const teamLaps = state.lapData[id];
-                if (teamLaps && teamLaps.length > 0) {
-                    const lastLap = teamLaps[teamLaps.length - 1];
-                    const lastLapTime = parseRiTime(lastLap.ri_time_of_day);
-                    ps.enterTime = lastLapTime || (timestamp - 2500);
-                } else {
-                    ps.enterTime = timestamp - 2500;
-                }
+                ps.enterTime = timestamp;
             } else if (!nowInPit && ps.inPit) {
-                // 出站
                 ps.inPit = false;
                 ps.enterTime = null;
             }
@@ -561,6 +612,7 @@ async function pollRaceData() {
             lapData: state.lapData,
             pitAnalysis: state.pitAnalysis,
             pitStatus: state.pitStatus,
+            pitTimer: state.trackedTeamId ? (state.pitTimers[String(state.trackedTeamId)] || null) : null,
             accurateDrivers,
             timestamp,
         });
@@ -606,18 +658,33 @@ function getStintSummary() {
     return summary;
 }
 
+const POLL_BASE_MS = 2000;  // 基础轮询间隔
+const POLL_FAST_MS = 1000;  // 选中车队在维修区时加密，提高进/出P精度
+
+function scheduleNextPoll() {
+    if (!state.polling) return;
+    // 选中车队在维修区 → 加密轮询，让出P时刻更精确
+    const tracked = state.trackedTeamId
+        ? state.items.find(i => String(i.id) === String(state.trackedTeamId))
+        : null;
+    const fast = tracked && (tracked.st || 0) >= 2;
+    const delay = fast ? POLL_FAST_MS : POLL_BASE_MS;
+    state.pollTimer = setTimeout(async () => {
+        await pollRaceData();
+        scheduleNextPoll();
+    }, delay);
+}
+
 function startPolling() {
-    if (state.pollInterval) clearInterval(state.pollInterval);
+    if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
     state.polling = true;
     console.log(`Polling started: ssid=${state.ssid}, pid=${state.pid}`);
-    pollRaceData(); // immediate first poll
-    state.pollInterval = setInterval(pollRaceData, 5000);
+    pollRaceData().finally(() => scheduleNextPoll()); // 首拉后开始自适应循环
 }
 
 function stopPolling() {
-    if (state.pollInterval) clearInterval(state.pollInterval);
+    if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
     state.polling = false;
-    state.pollInterval = null;
     // 停止时保存完整快照
     const tag = 'final_' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     saveStateToDisk(tag);
@@ -672,6 +739,8 @@ wss.on('connection', (ws) => {
                 state.snapshots = [];
                 state.controlMessages = [];
                 state.lapData = {};
+                state.pitTimers = {};
+                state.pitStatus = {};
                 startPolling();
             }
 
@@ -687,6 +756,19 @@ wss.on('connection', (ws) => {
                 // 立即触发一次拉取，避免等 5 秒
                 if (state.polling) {
                     pollRaceData().catch(err => console.error('Immediate poll error:', err.message));
+                } else if (state.lapData[String(state.trackedTeamId)]) {
+                    // 回放模式：从已有 lapData 重算并广播
+                    recomputePitAnalysis();
+                    broadcast({
+                        type: 'race_update',
+                        raceInfo: state.raceInfo,
+                        items: state.items,
+                        controlMessages: state.controlMessages,
+                        stintTracker: getStintSummary(),
+                        lapData: state.lapData,
+                        pitAnalysis: state.pitAnalysis,
+                        timestamp: Date.now(),
+                    });
                 }
             }
 
@@ -837,6 +919,98 @@ app.get('/api/rounds/:ssid/:pid', async (req, res) => {
     }
 });
 
+/**
+ * 把 calendar-list 的 ritem 映射成精简场次对象
+ */
+function mapSession(s) {
+    return {
+        id: s.id,
+        name: s.name,
+        status: s.status,
+        stName: s.stName || '',
+        type: s.type,
+        typeName: s.typeName || '',
+        startTime: s.startTime || '',
+        time: s.time || '',
+    };
+}
+
+/**
+ * 列出某分站(rid)下的全部场次「组」（懒加载：只拉一次，首个组自带场次，其余按需展开）。
+ * 返回: { groups: [{ id, name, loaded, sessions: [...] }] }
+ */
+app.get('/api/sessions/:ssid/:rid', async (req, res) => {
+    try {
+        const { ssid, rid } = req.params;
+        const data = await callXkartingApi({
+            flag: 'get-race-calendar-list',
+            ssid, userId: '1', itemId: '0', pid: rid,
+            timeStamp: Date.now().toString(), syskey: 'x',
+        });
+        const groups = (data.items || []).map(g => ({
+            id: g.id,
+            name: g.name,
+            loaded: Array.isArray(g.ritems),          // 首个组通常已带 ritems
+            sessions: (g.ritems || []).map(mapSession),
+        }));
+        res.json({ groups });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * 按需拉取单个场次组(itemId)下的场次明细
+ */
+app.get('/api/session-group/:ssid/:rid/:itemId', async (req, res) => {
+    try {
+        const { ssid, rid, itemId } = req.params;
+        const data = await callXkartingApi({
+            flag: 'get-race-calendar-list',
+            ssid, userId: '1', itemId, pid: rid,
+            timeStamp: Date.now().toString(), syskey: 'x',
+        });
+        const matched = (data.items || []).find(x => String(x.id) === String(itemId));
+        res.json({ sessions: (matched?.ritems || []).map(mapSession) });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * 已结束比赛的最终成绩（get-race-result-by-pid）
+ * 先取 groupList，再按组名取每组成绩行（去重）。
+ * 返回: { round, groupList, groups: [{ name, total, items:[...] }] }
+ */
+app.get('/api/result/:ssid/:pid', async (req, res) => {
+    try {
+        const { ssid, pid } = req.params;
+        const base = { flag: 'get-race-result-by-pid', ssid, userId: '1', pid, isTest: '1', syskey: 'x' };
+        // 1. 先拿组列表
+        const head = await callXkartingApi({ ...base, group: '', timestamp: Date.now().toString() });
+        const groupList = head.groupList || [];
+        // 2. 指定组或全部组取成绩行
+        const wanted = req.query.group ? [{ name: req.query.group }] : (groupList.length ? groupList : [{ name: '' }]);
+        const groups = [];
+        for (const g of wanted) {
+            const r = await callXkartingApi({ ...base, group: g.name || '', timestamp: Date.now().toString() });
+            // 按 carNo 去重（接口会重复返回每队多行）
+            const seen = new Set();
+            const items = [];
+            for (const it of (r.items || [])) {
+                if (seen.has(it.carNo)) continue;
+                seen.add(it.carNo);
+                items.push(it);
+            }
+            groups.push({ name: g.name || (groupList[0] && groupList[0].name) || '', total: g.total, items });
+            await new Promise(rr => setTimeout(rr, 150));
+        }
+        res.json({ round: head.round, groupList, groups });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/control/:pid', async (req, res) => {
     try {
         const data = await callXkartingApi({
@@ -912,7 +1086,8 @@ app.post('/api/save-all-laps', async (req, res) => {
 });
 
 app.post('/api/load', (req, res) => {
-    const filepath = req.body.filepath || path.join(DATA_DIR, `${req.body.pid || state.pid}_latest.json`);
+    const filepath = req.body.filepath
+        || (req.body.filename ? path.join(DATA_DIR, req.body.filename) : path.join(DATA_DIR, `${req.body.pid || state.pid}_latest.json`));
     const ok = loadSavedState(filepath);
     if (ok) {
         broadcast({

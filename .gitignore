@@ -19,3 +19,10 @@ npm-debug.log*
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 比赛录制数据（运行时产生，体积大且频繁变动）
+05-后端服务/race-data/
+
+# TS 构建缓存
+*.tsbuildinfo
+.vite/

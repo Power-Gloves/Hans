@@ -1,10 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import { StintInfo, TeamItem, PitAnalysis, AccurateDriverData } from '../App'
-
-interface PitStatusData {
-  inPit: boolean
-  enterTime: number | null
-}
+import { useState, useEffect } from 'react'
+import { TeamItem, PitAnalysis } from '../App'
 
 interface ControlMsg {
   id: number
@@ -19,177 +14,160 @@ interface LapItem {
 }
 
 interface Props {
-  stint: StintInfo
   teamItem?: TeamItem
-  pitAnalysis?: PitAnalysis | null
-  pitStatus?: PitStatusData | null
-  accurateDrivers?: AccurateDriverData | null
   controlMessages?: ControlMsg[]
   lapData?: LapItem[]
+  pitAnalysis?: PitAnalysis | null
+  pitTimer?: PitTimerData | null
 }
 
-function formatDuration(ms: number): string {
+export interface PitTimerData {
+  inPit: boolean
+  enterTime: number | null
+  events: { enterTime: number; exitTime: number; durationMs: number }[]
+}
+
+const MIN_PIT_MS = 2 * 60 * 1000 // 强制进站 2 分钟
+
+// 圈速 ms → m:ss.mmm
+function formatLap(ms: number): string {
+  if (!ms || ms <= 0) return '--'
+  const min = Math.floor(ms / 60000)
+  const sec = Math.floor((ms % 60000) / 1000)
+  const msec = ms % 1000
+  return `${min}:${sec.toString().padStart(2, '0')}.${msec.toString().padStart(3, '0')}`
+}
+
+// 时长 ms → m:ss
+function formatDur(ms: number): string {
+  if (!ms || ms <= 0) return '--'
   const totalSec = Math.floor(ms / 1000)
   const min = Math.floor(totalSec / 60)
   const sec = totalSec % 60
   return `${min}:${sec.toString().padStart(2, '0')}`
 }
 
-const MAX_STINT_MS = 70 * 60 * 1000 // 70 minutes
-const WARN_STINT_MS = 60 * 60 * 1000 // 60 minutes warning
-const MIN_PIT_MS = 2 * 60 * 1000 // 2 minutes minimum pit
-
+// "2026/5/17 13:59:48" → 13:59:48 时间戳(ms)
 function parseRiTime(s?: string | null): number | null {
   if (!s) return null
   const m = s.match(/(\d+)\/(\d+)\/(\d+)\s+(\d+):(\d+):(\d+)/)
   if (!m) return null
   return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime()
 }
+// epoch ms → HH:MM:SS
+function clockFromMs(ms: number | null): string {
+  if (!ms) return '--'
+  const d = new Date(ms)
+  return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`
+}
+// 取 "HH:MM:SS"
+function clock(s?: string | null): string {
+  const m = (s || '').match(/(\d+:\d+:\d+)$/)
+  return m ? m[1] : ''
+}
 
-export default function StintPanel({ stint, teamItem, pitAnalysis, pitStatus, accurateDrivers, controlMessages = [], lapData }: Props) {
-  const [now, setNow] = useState(Date.now())
-  const [selectedStintNo, setSelectedStintNo] = useState<number | null>(null)
+/**
+ * 右侧面板 —— 只展示接口直接返回的真实数据：
+ *  - 当前车手 / 圈数 / 进站次数 / 最快圈 / 最后圈（实时排名字段，真实）
+ *  - 圈速曲线（lapItems 的真实每圈时间）
+ *  - 罚单（赛事控制消息，真实）
+ * 不含任何估算/推断（进站时长、单棒计时、历史车手归属等已移除）。
+ */
+export default function StintPanel({ teamItem, controlMessages = [], lapData, pitAnalysis, pitTimer }: Props) {
   const [hoverLap, setHoverLap] = useState<{ idx: number; lapNo: number; time: number; x: number; y: number } | null>(null)
-
+  // 图表棒次选择：null = 全部
+  const [chartStint, setChartStint] = useState<number | null>(null)
+  // 本地秒级时钟，用于实时计算「进行中」棒的时长
+  const [now, setNow] = useState(Date.now())
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(t)
   }, [])
 
-  // 当前棒精确时长：优先用 lapItems 起点 + 本地 tick 实时计算
-  const currentStintStart = pitAnalysis?.currentStint?.startTime
-    ? parseRiTime(pitAnalysis.currentStint.startTime)
-    : null
-  const currentStintMs = currentStintStart
-    ? Math.max(0, now - currentStintStart)
-    : stint.currentStintDuration  // fallback
+  if (!teamItem) return null
 
-  const stintPercent = Math.min((currentStintMs / MAX_STINT_MS) * 100, 100)
-  const isWarning = currentStintMs >= WARN_STINT_MS
-  const isDanger = currentStintMs >= MAX_STINT_MS
-
-  // Pit stop timer: 后端追踪 st 变化并记录精确进站时间
-  const inPit = pitStatus?.inPit || (teamItem && teamItem.st >= 2) || false
-  const pitEnterTime = pitStatus?.enterTime || null
-  const pitElapsed = inPit && pitEnterTime ? now - pitEnterTime : 0
-  const pitRemaining = inPit ? Math.max(0, MIN_PIT_MS - pitElapsed) : 0
-
-  // 合并棒次列表
-  const stintList = useMemo(() => {
-    if (!pitAnalysis) return []
-    const pits = pitAnalysis.pits
-    const stints = pitAnalysis.stints
-    const list: { stintNo: number; driver: string; laps: number; startLap: number; endLap: number; duration: number; startTime: string; endTime: string; pitSec: number | null; pitBelowMin: boolean }[] = []
-
-    stints.forEach((s, idx) => {
-      const pit = pits[idx] || null
-      const startMs = parseRiTime(s.startTime)
-      const endMs = parseRiTime(s.endTime)
-      const duration = (startMs && endMs) ? endMs - startMs : 0
-      const driverData = accurateDrivers?.perStint[idx]
-      // 提取时分秒 (从 "2026/5/17 13:06:08" 取 "13:06")
-      const timeStr = s.startTime?.match(/(\d+:\d+):\d+$/)?.[1] || ''
-      const endTimeStr = s.endTime?.match(/(\d+:\d+):\d+$/)?.[1] || ''
-      list.push({
-        stintNo: idx + 1,
-        driver: driverData?.driver || '未知',
-        laps: s.laps,
-        startLap: s.startLap,
-        endLap: s.endLap,
-        duration,
-        startTime: timeStr,
-        endTime: endTimeStr,
-        pitSec: pit ? pit.pitDurationSec : null,
-        pitBelowMin: pit ? pit.belowMin : false,
-      })
+  // 棒次区间（用于图表按棒切分）：[{no, startLap, endLap, isCurrent}]
+  const stintRanges: { no: number; startLap: number; endLap: number; isCurrent: boolean }[] = []
+  if (pitAnalysis) {
+    pitAnalysis.stints.forEach((s, i) => {
+      stintRanges.push({ no: i + 1, startLap: s.startLap, endLap: s.endLap, isCurrent: false })
     })
-
-    // 当前棒
     if (pitAnalysis.currentStint) {
-      const cs = pitAnalysis.currentStint
-      const timeStr = cs.startTime?.match(/(\d+:\d+):\d+$/)?.[1] || ''
-      list.push({
-        stintNo: stints.length + 1,
-        driver: stint.currentDriver,
-        laps: cs.currentLap - cs.startLap + 1,
-        startLap: cs.startLap,
-        endLap: cs.currentLap,
-        duration: currentStintMs,
-        startTime: timeStr,
-        endTime: '',
-        pitSec: null,
-        pitBelowMin: false,
+      stintRanges.push({
+        no: stintRanges.length + 1,
+        startLap: pitAnalysis.currentStint.startLap,
+        endLap: pitAnalysis.currentStint.currentLap,
+        isCurrent: true,
       })
     }
-
-    return list
-  }, [pitAnalysis, accurateDrivers, stint.currentDriver, currentStintMs])
-
-  const totalStints = stintList.length
-
-  // 选中的棒次 (null = 当前棒)
-  const viewStint = selectedStintNo
-    ? stintList.find(s => s.stintNo === selectedStintNo) || stintList[stintList.length - 1]
-    : stintList[stintList.length - 1]
-  const isViewingCurrent = !selectedStintNo || selectedStintNo === totalStints
+  }
+  const activeRange = chartStint != null ? stintRanges.find(r => r.no === chartStint) : null
 
   return (
-    <div className="bg-gray-800 rounded-lg p-3 sm:p-4 space-y-2 sm:space-y-3">
-      {/* 车队名 */}
-      <h3 className="font-semibold text-orange-400 text-sm">
-        {stint.teamName} {teamItem && `#${teamItem.carNo}`}
-      </h3>
+    <div className="bg-gray-800 rounded-lg p-3 sm:p-4 space-y-3">
+      {/* 车队名 + 当前车手 */}
+      <div>
+        <h3 className="font-semibold text-orange-400 text-sm">
+          {teamItem.team} #{teamItem.carNo}
+        </h3>
+        <div className="text-xs text-gray-400 mt-0.5">
+          当前车手：<span className="text-white font-semibold">{teamItem.name || '--'}</span>
+        </div>
+      </div>
 
-      {/* 1. 棒次信息: 车手 + 第几棒 + 时长 */}
-      {viewStint && (
-        <div className={`rounded p-3 ${isViewingCurrent ? 'bg-gray-700/50' : 'bg-indigo-900/30 border border-indigo-700/40'}`}>
-          <div className="flex justify-between items-center">
-            <div>
-              <span className="text-xs text-gray-400">第{viewStint.stintNo}棒{!isViewingCurrent && ' (历史)'}</span>
-              <span className="ml-2 text-sm font-semibold text-white">{viewStint.driver}</span>
-              {!isViewingCurrent && viewStint.startTime && (
-                <span className="ml-2 text-[10px] text-gray-500">{viewStint.startTime}-{viewStint.endTime}</span>
-              )}
-            </div>
-            <div className="text-right">
-              <span className={`font-mono text-lg font-bold ${isViewingCurrent ? (isDanger ? 'text-red-400 animate-pulse' : isWarning ? 'text-yellow-400' : 'text-green-400') : 'text-indigo-300'}`}>
-                {formatDuration(viewStint.duration)}
-              </span>
-              {!isViewingCurrent && (
-                <div className="text-[10px] text-gray-500">L{viewStint.startLap}-{viewStint.endLap} ({viewStint.laps}圈)</div>
-              )}
-            </div>
-          </div>
-          {isViewingCurrent && (
-            <>
-              <div className="w-full bg-gray-600 rounded-full h-1.5 mt-2">
-                <div
-                  className={`h-1.5 rounded-full transition-all ${isDanger ? 'bg-red-500' : isWarning ? 'bg-yellow-500' : 'bg-green-500'}`}
-                  style={{ width: `${stintPercent}%` }}
-                />
-              </div>
-              <div className="flex justify-between text-[10px] text-gray-500 mt-0.5">
-                <span>0</span>
-                <span>60min</span>
-                <span>70min MAX</span>
-              </div>
-            </>
-          )}
-          {!isViewingCurrent && (
-            <button onClick={() => setSelectedStintNo(null)} className="text-[10px] text-indigo-400 hover:text-indigo-300 mt-1">← 返回当前棒</button>
-          )}
+      {/* 真实统计：圈数 / 进站次数 / 最快圈 / 最后圈 */}
+      <div className="grid grid-cols-4 gap-2 text-center">
+        <div className="bg-gray-700/40 rounded p-2">
+          <div className="text-[10px] text-gray-500">圈数</div>
+          <div className="font-mono font-bold text-sm">{teamItem.laps}</div>
+        </div>
+        <div className="bg-gray-700/40 rounded p-2">
+          <div className="text-[10px] text-gray-500">进站</div>
+          <div className="font-mono font-bold text-sm">{teamItem.pitstops ?? 0}</div>
+        </div>
+        <div className="bg-gray-700/40 rounded p-2">
+          <div className="text-[10px] text-gray-500">最快圈</div>
+          <div className="font-mono font-bold text-sm text-purple-300">{formatLap(teamItem.bestTm)}</div>
+        </div>
+        <div className="bg-gray-700/40 rounded p-2">
+          <div className="text-[10px] text-gray-500">最后圈</div>
+          <div className="font-mono font-bold text-sm">{formatLap(teamItem.lastTm)}</div>
+        </div>
+      </div>
+
+      {/* 圈速曲线（真实每圈时间，可按棒切分；隐藏明显异常的进站圈以便看清） */}
+      {stintRanges.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          <button
+            className={`px-2 py-0.5 text-[11px] rounded ${chartStint == null ? 'bg-orange-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+            onClick={() => setChartStint(null)}
+          >全部</button>
+          {stintRanges.map(r => (
+            <button
+              key={r.no}
+              className={`px-2 py-0.5 text-[11px] rounded ${chartStint === r.no ? 'bg-orange-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+              onClick={() => setChartStint(r.no)}
+              title={`L${r.startLap}-${r.endLap}`}
+            >
+              {r.isCurrent ? '当前棒' : `第${r.no}棒`}
+            </button>
+          ))}
         </div>
       )}
-
-      {/* 2. 圈速曲线 */}
       {(() => {
-        if (!lapData || !viewStint) return null
-        const startLap = viewStint.startLap
-        const endLap = viewStint.endLap
-        const baseTm = pitAnalysis?.baseLapTm || 60000
-        const threshold = baseTm * 1.6
-        const laps = lapData.filter(l => l.laps >= startLap && l.laps <= endLap && l.lapTm > 0 && l.lapTm < threshold)
-        if (laps.length < 2) return null
+        if (!lapData || lapData.length < 2) return null
+        // 选中某棒 → 只取该棒区间；否则取最近 40 圈
+        const source = activeRange
+          ? lapData.filter(l => l.laps >= activeRange.startLap && l.laps <= activeRange.endLap)
+          : lapData.slice(-40)
+        const recent = source
+        // 中位数估算正常圈速，仅用于「图表缩放/隐藏异常圈」，不产生任何对外数据
+        const sortedAll = recent.map(l => l.lapTm).filter(t => t > 0).sort((a, b) => a - b)
+        const median = sortedAll[Math.floor(sortedAll.length / 2)] || 70000
+        const laps = recent.filter(l => l.lapTm > 0 && l.lapTm < median * 1.6)
+        if (laps.length < 2) return (
+          <div className="bg-gray-900/60 rounded-lg p-3 text-xs text-gray-600 text-center">该棒圈数不足，无法绘图</div>
+        )
 
         const times = laps.map(l => l.lapTm)
         const minT = Math.min(...times)
@@ -199,72 +177,42 @@ export default function StintPanel({ stint, teamItem, pitAnalysis, pitStatus, ac
         const lo = minT - padT
         const hi = maxT + padT
         const avgTm = times.reduce((a, b) => a + b, 0) / times.length
+        const hiddenCount = recent.length - laps.length
 
-        // 趋势（线性回归）
-        const n = times.length
-        const sumX = times.reduce((s, _, i) => s + i, 0)
-        const sumY = times.reduce((s, v) => s + v, 0)
-        const sumXY = times.reduce((s, v, i) => s + i * v, 0)
-        const sumX2 = times.reduce((s, _, i) => s + i * i, 0)
-        const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX)
-        const intercept = (sumY - slope * sumX) / n
-        const trendStart = intercept
-        const trendEnd = intercept + slope * (n - 1)
-        const recent5 = times.slice(-Math.min(5, Math.floor(n / 2)))
-        const first5 = times.slice(0, Math.min(5, Math.floor(n / 2)))
-        const recent5Avg = recent5.reduce((a, b) => a + b, 0) / recent5.length
-        const first5Avg = first5.reduce((a, b) => a + b, 0) / first5.length
-        const delta = recent5Avg - first5Avg
-
-        // 秒数格式: 69541 → "69.5"
         const fmt = (ms: number) => (ms / 1000).toFixed(1)
         const fmtFull = (ms: number) => (ms / 1000).toFixed(3)
 
-        // 布局：最小边距，最大化图表区域
         const ML = 4, MR = 4, MT = 14, MB = 12
         const W = 300, H = 120
         const cW = W - ML - MR, cH = H - MT - MB
-
         const toX = (i: number) => ML + (i / Math.max(laps.length - 1, 1)) * cW
         const toY = (t: number) => MT + cH - ((t - lo) / (hi - lo)) * cH
 
         const polyPts = laps.map((l, i) => `${toX(i)},${toY(l.lapTm)}`).join(' ')
-        // 渐变填充区域
         const areaPts = `${toX(0)},${MT + cH} ${polyPts} ${toX(laps.length - 1)},${MT + cH}`
         const avgY = toY(avgTm)
-
-        // Y 轴只标 2 条: 最快和最慢
         const yLabels = [
           { val: minT, color: '#a78bfa', label: fmt(minT) },
           { val: maxT, color: '#6b7280', label: fmt(maxT) },
         ]
-        // X 轴圈号
         const xStep = Math.max(1, Math.ceil(laps.length / 6))
         const xIdxs = laps.map((_, i) => i).filter(i => i % xStep === 0 || i === laps.length - 1)
-
-        // 找最快和最慢的索引
         const bestIdx = times.indexOf(minT)
         const worstIdx = times.indexOf(maxT)
 
         return (
           <div className="bg-gray-900/60 rounded-lg p-2">
-            {/* 统计栏 */}
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
-                <span className="text-[11px] text-gray-400">{laps.length}圈</span>
+                <span className="text-[11px] text-gray-400">{activeRange ? `${activeRange.isCurrent ? '当前棒' : '第' + activeRange.no + '棒'} ${laps.length}圈` : `近 ${laps.length} 圈`}</span>
                 <span className="text-xs font-mono font-bold text-purple-300">{fmtFull(minT)}s</span>
                 <span className="text-[10px] text-gray-500">最快</span>
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-[10px] text-gray-500">均</span>
                 <span className="text-xs font-mono text-gray-300">{fmt(avgTm)}s</span>
-                {n >= 4 && (
-                  <>
-                    <span className="text-[10px] text-gray-600">|</span>
-                    <span className={`text-xs font-mono font-semibold ${delta > 500 ? 'text-red-400' : delta < -500 ? 'text-green-400' : 'text-gray-500'}`}>
-                      {delta > 0 ? '↑' : delta < -500 ? '↓' : '→'}{Math.abs(delta / 1000).toFixed(1)}s
-                    </span>
-                  </>
+                {hiddenCount > 0 && (
+                  <span className="text-[10px] text-gray-600">· 隐藏{hiddenCount}进站圈</span>
                 )}
               </div>
             </div>
@@ -275,31 +223,19 @@ export default function StintPanel({ stint, teamItem, pitAnalysis, pitStatus, ac
                   <stop offset="100%" stopColor="#a78bfa" stopOpacity="0.02" />
                 </linearGradient>
               </defs>
-              {/* Y 轴刻度 */}
               {yLabels.map((t, i) => (
                 <g key={`y${i}`}>
                   <line x1={ML} y1={toY(t.val)} x2={W - MR} y2={toY(t.val)} stroke="#374151" strokeWidth="0.4" />
                   <text x={ML + 2} y={toY(t.val) - 2} textAnchor="start" fill={t.color} fontSize="7" fontFamily="monospace" opacity="0.7">{t.label}</text>
                 </g>
               ))}
-              {/* 均值虚线 */}
               <line x1={ML} y1={avgY} x2={W - MR} y2={avgY} stroke="#8b5cf6" strokeWidth="0.6" strokeDasharray="3,3" opacity="0.4" />
               <text x={W - MR - 2} y={avgY - 2} textAnchor="end" fill="#8b5cf6" fontSize="6.5" opacity="0.6">avg</text>
-              {/* X 轴圈号 */}
               {xIdxs.map(i => (
                 <text key={`x${i}`} x={toX(i)} y={H - 1} textAnchor="middle" fill="#4b5563" fontSize="7">{laps[i].laps}</text>
               ))}
-              {/* 趋势线 */}
-              {n >= 4 && (
-                <line x1={toX(0)} y1={toY(trendStart)} x2={toX(n - 1)} y2={toY(trendEnd)}
-                  stroke={delta > 500 ? '#f87171' : delta < -500 ? '#34d399' : '#6b7280'}
-                  strokeWidth="1.2" strokeDasharray="6,4" opacity="0.5" />
-              )}
-              {/* 面积填充 */}
               <polygon points={areaPts} fill="url(#areaGrad)" />
-              {/* 主折线 */}
               <polyline points={polyPts} fill="none" stroke="#a78bfa" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-              {/* 数据点 */}
               {laps.map((l, i) => {
                 const x = toX(i)
                 const y = toY(l.lapTm)
@@ -312,7 +248,6 @@ export default function StintPanel({ stint, teamItem, pitAnalysis, pitStatus, ac
                     {(isBest || isWorst) && <circle cx={x} cy={y} r={r + 3} fill={fill} opacity="0.15" />}
                     <circle cx={x} cy={y} r={r} fill={fill}
                       stroke={isBest ? '#e9d5ff' : isWorst ? '#fecaca' : '#1f2937'} strokeWidth={isBest || isWorst ? 1.5 : 0.8} />
-                    {/* 透明热区，加大点击/hover 范围 */}
                     <circle cx={x} cy={y} r={10} fill="transparent"
                       onMouseEnter={() => setHoverLap({ idx: i, lapNo: l.laps, time: l.lapTm, x, y })}
                       onMouseLeave={() => setHoverLap(null)}
@@ -320,7 +255,6 @@ export default function StintPanel({ stint, teamItem, pitAnalysis, pitStatus, ac
                   </g>
                 )
               })}
-              {/* hover 指示线 + 标签 */}
               {hoverLap && (() => {
                 const hx = hoverLap.x, hy = hoverLap.y
                 const isBest = hoverLap.idx === bestIdx
@@ -339,99 +273,153 @@ export default function StintPanel({ stint, teamItem, pitAnalysis, pitStatus, ac
                   </>
                 )
               })()}
-              {/* 最快标注 */}
               <text x={toX(bestIdx)} y={toY(minT) - 8} textAnchor="middle" fill="#c084fc" fontSize="9" fontWeight="bold" fontFamily="monospace">{fmt(minT)}</text>
               <text x={toX(bestIdx)} y={toY(minT) - 17} textAnchor="middle" fill="#c084fc" fontSize="6.5" opacity="0.7">★ L{laps[bestIdx].laps}</text>
-              {/* 最慢标注 */}
               <text x={toX(worstIdx)} y={toY(maxT) + 13} textAnchor="middle" fill="#f87171" fontSize="8" fontFamily="monospace">{fmt(maxT)}</text>
-              {/* 最后一圈标注 */}
-              {laps.length > 2 && bestIdx !== laps.length - 1 && worstIdx !== laps.length - 1 && (
-                <text x={toX(laps.length - 1)} y={toY(times[times.length - 1]) - 7} textAnchor="end" fill="#9ca3af" fontSize="7.5" fontFamily="monospace">{fmt(times[times.length - 1])}</text>
-              )}
             </svg>
           </div>
         )
       })()}
 
-      {/* 3. 进站计时 (仅进站时显示) */}
-      {inPit && (
-        <div className="bg-yellow-900/40 border border-yellow-600 rounded p-3">
-          <div className="flex justify-between items-center">
-            <span className="text-yellow-300 font-semibold text-sm">进站中</span>
-            <span className={`font-mono text-2xl font-bold ${pitRemaining > 0 ? 'text-yellow-300 animate-pulse' : 'text-green-400'}`}>
-              {formatDuration(pitElapsed)}
-            </span>
-          </div>
-          <div className="w-full bg-gray-700 rounded-full h-2 mt-2">
-            <div
-              className={`h-2 rounded-full transition-all ${pitRemaining > 0 ? 'bg-yellow-500' : 'bg-green-500'}`}
-              style={{ width: `${Math.min(100, (pitElapsed / MIN_PIT_MS) * 100)}%` }}
-            />
-          </div>
-          <div className="text-xs text-right mt-1">
-            <span className={pitRemaining > 0 ? 'text-yellow-400' : 'text-green-400 font-semibold'}>
-              {pitRemaining > 0 ? `还需 ${formatDuration(pitRemaining)}` : '✓ 可出站'}
-            </span>
-          </div>
+      {/* 进站实时计时（基于 st 跳变，进站期间加密轮询，秒级精度） */}
+      {pitTimer?.inPit && !pitTimer.enterTime && (
+        <div className="bg-yellow-900/30 border border-yellow-700/50 rounded p-2 text-xs text-yellow-400">
+          🅿️ 进站中（开始监控前已进站，进P时刻未捕捉，本次不计时）
         </div>
       )}
-
-      {/* 3. 棒次记录表格 */}
-      {stintList.length > 0 && (
-        <div>
-          <div className="text-xs text-gray-400 mb-1">
-            棒次记录 <span className="text-gray-300 font-semibold">{stintList.length}</span> 棒 / 进站 <span className="text-gray-300 font-semibold">{pitAnalysis?.pits.length || 0}</span> 次
+      {pitTimer?.inPit && pitTimer.enterTime && (() => {
+        const elapsed = Math.max(0, now - pitTimer.enterTime)
+        const remaining = Math.max(0, MIN_PIT_MS - elapsed)
+        const done = remaining <= 0
+        return (
+          <div className="bg-yellow-900/40 border border-yellow-600 rounded p-3">
+            <div className="flex justify-between items-center">
+              <div>
+                <span className="text-yellow-300 font-semibold text-sm">进站中</span>
+                <span className="ml-2 text-[10px] text-gray-400">进P {clockFromMs(pitTimer.enterTime)}</span>
+              </div>
+              <span className={`font-mono text-2xl font-bold ${done ? 'text-green-400' : 'text-yellow-300 animate-pulse'}`}>
+                {formatDur(elapsed)}
+              </span>
+            </div>
+            <div className="w-full bg-gray-700 rounded-full h-2 mt-2">
+              <div className={`h-2 rounded-full ${done ? 'bg-green-500' : 'bg-yellow-500'}`}
+                style={{ width: `${Math.min(100, (elapsed / MIN_PIT_MS) * 100)}%` }} />
+            </div>
+            <div className="text-xs text-right mt-1">
+              <span className={done ? 'text-green-400 font-semibold' : 'text-yellow-400'}>
+                {done ? '✓ 已满 2 分钟，可出站' : `还需 ${formatDur(remaining)}`}
+              </span>
+            </div>
           </div>
+        )
+      })()}
+
+      {/* 真实棒次记录（圈数/进站时刻/单棒时长，全来自真实过线时刻） */}
+      {pitAnalysis && (pitAnalysis.stints.length > 0 || pitAnalysis.currentStint) && (() => {
+        const rows = pitAnalysis.stints.map((s, i) => {
+          const startMs = parseRiTime(s.startTime)
+          const endMs = parseRiTime(s.endTime)
+          return {
+            no: i + 1,
+            startLap: s.startLap,
+            endLap: s.endLap,
+            laps: s.laps,
+            pitTime: clock(s.endTime),       // 进站时刻 = 该棒结束(进站圈)过线时刻
+            duration: startMs && endMs ? endMs - startMs : 0,
+            current: false,
+          }
+        })
+        const cs = pitAnalysis.currentStint
+        if (cs) {
+          const startMs = parseRiTime(cs.startTime)
+          rows.push({
+            no: rows.length + 1,
+            startLap: cs.startLap,
+            endLap: cs.currentLap,
+            laps: cs.currentLap - cs.startLap + 1,
+            pitTime: '',
+            duration: startMs ? Math.max(0, now - startMs) : 0,
+            current: true,
+          })
+        }
+        return (
           <div>
+            <div className="text-xs text-gray-400 mb-1">
+              棒次记录 <span className="text-gray-300 font-semibold">{rows.length}</span> 棒
+              <span className="ml-1">/ 进站 <span className="text-gray-300 font-semibold">{pitAnalysis.pitCount}</span> 次</span>
+              {pitAnalysis.realPitstops !== null && pitAnalysis.realPitstops !== pitAnalysis.pitCount && (
+                <span className="ml-1 text-yellow-500">(接口计数 {pitAnalysis.realPitstops})</span>
+              )}
+            </div>
             <table className="w-full text-xs">
               <thead>
                 <tr className="text-gray-500 border-b border-gray-700">
                   <th className="text-left py-1 w-6">#</th>
-                  <th className="text-left py-1">车手</th>
-                  <th className="text-right py-1 w-10">圈</th>
-                  <th className="text-right py-1 w-12">出站</th>
-                  <th className="text-right py-1 w-12">进站</th>
-                  <th className="text-right py-1 w-14">时长</th>
-                  <th className="text-right py-1 w-12">停站</th>
+                  <th className="text-right py-1">起止圈</th>
+                  <th className="text-right py-1 w-10">圈数</th>
+                  <th className="text-right py-1 w-16">进站时刻</th>
+                  <th className="text-right py-1 w-14">单棒时长</th>
                 </tr>
               </thead>
               <tbody>
-                {stintList.slice().reverse().map((s, ri) => {
-                  const isCurrent = ri === 0
-                  return (
-                  <tr
-                    key={s.stintNo}
-                    className={`border-b border-gray-700/50 cursor-pointer ${isCurrent ? 'bg-orange-900/20' : s.stintNo === selectedStintNo ? 'bg-indigo-900/30' : 'hover:bg-gray-700/30'}`}
-                    onClick={() => setSelectedStintNo(isCurrent ? null : s.stintNo)}
-                  >
+                {rows.slice().reverse().map(r => (
+                  <tr key={r.no} className={`border-b border-gray-700/50 ${r.current ? 'bg-orange-900/20' : ''}`}>
                     <td className="py-1 text-gray-500">
-                      {isCurrent ? <span className="text-orange-400 font-semibold">‣{s.stintNo}</span> : s.stintNo}
+                      {r.current ? <span className="text-orange-400 font-semibold">‣{r.no}</span> : r.no}
                     </td>
-                    <td className={`py-1 truncate max-w-[80px] ${isCurrent ? 'text-orange-300 font-semibold' : 'text-gray-200'}`}>{s.driver}</td>
-                    <td className="py-1 text-right text-gray-400">{s.laps}</td>
-                    <td className="py-1 text-right text-gray-400 font-mono">{s.startTime}</td>
-                    <td className="py-1 text-right text-gray-400 font-mono">{isCurrent ? '-' : s.endTime}</td>
-                    <td className={`py-1 text-right font-mono font-medium ${isCurrent ? 'text-orange-300' : 'text-gray-200'}`}>{formatDuration(s.duration)}</td>
-                    <td className="py-1 text-right font-mono">
-                      {s.pitSec !== null ? (
-                        <span className={s.pitBelowMin ? 'text-red-400' : 'text-green-400/80'}>
-                          {Math.floor(s.pitSec / 60)}:{Math.round(s.pitSec % 60).toString().padStart(2, '0')}
-                        </span>
-                      ) : (
-                        <span className="text-gray-600">-</span>
-                      )}
-                    </td>
+                    <td className="py-1 text-right font-mono text-gray-400">L{r.startLap}-{r.endLap}</td>
+                    <td className="py-1 text-right font-mono">{r.laps}</td>
+                    <td className="py-1 text-right font-mono text-gray-400">{r.current ? '进行中' : r.pitTime}</td>
+                    <td className={`py-1 text-right font-mono font-medium ${r.current ? 'text-orange-300' : 'text-gray-200'}`}>{formatDur(r.duration)}</td>
                   </tr>
-                  )
-                })}
+                ))}
               </tbody>
             </table>
+            <div className="text-[10px] text-gray-600 mt-1">数据来自真实过线时刻；进站圈经 pitstops 交叉校验。</div>
           </div>
+        )
+      })()}
+
+      {/* 进站记录（进P/出P/时长，基于 st 跳变，秒级精度） */}
+      {pitTimer && pitTimer.events.length > 0 && (
+        <div>
+          <div className="text-xs text-gray-400 mb-1">
+            进站记录（进P / 出P）<span className="text-gray-300 font-semibold ml-1">{pitTimer.events.length}</span> 次
+          </div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-gray-500 border-b border-gray-700">
+                <th className="text-left py-1 w-6">#</th>
+                <th className="text-right py-1">进P</th>
+                <th className="text-right py-1">出P</th>
+                <th className="text-right py-1 w-16">停留</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pitTimer.events.slice().reverse().map((e, ri) => {
+                const no = pitTimer.events.length - ri
+                const below = e.durationMs < MIN_PIT_MS
+                return (
+                  <tr key={no} className="border-b border-gray-700/50">
+                    <td className="py-1 text-gray-500">{no}</td>
+                    <td className="py-1 text-right font-mono text-gray-400">{clockFromMs(e.enterTime)}</td>
+                    <td className="py-1 text-right font-mono text-gray-400">{clockFromMs(e.exitTime)}</td>
+                    <td className={`py-1 text-right font-mono font-medium ${below ? 'text-red-400' : 'text-green-400/80'}`}>
+                      {formatDur(e.durationMs)}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+          <div className="text-[10px] text-gray-600 mt-1">基于车辆状态(st)跳变捕捉，精度≈轮询间隔（进站时已加密）。非赛会官方计时。</div>
         </div>
       )}
-      {/* 4. 罚单 */}
+
+      {/* 罚单（真实赛事控制消息） */}
       {(() => {
-        const carNo = teamItem?.carNo
+        const carNo = teamItem.carNo
         const teamPenalties = carNo ? controlMessages.filter(m => m.cont.includes(`#${carNo}`)) : []
         return (
           <div className="border-t border-gray-700 pt-2">

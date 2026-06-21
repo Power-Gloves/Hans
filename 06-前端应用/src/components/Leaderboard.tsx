@@ -55,6 +55,12 @@ function getPitStatus(st: number): { label: string; color: string } | null {
   return null
 }
 
+// 关注车队：队名包含以下任一关键词即高亮+打标（按需在此增删）
+const WATCHED_TEAMS = ['麦浪']
+function isWatched(team: string): boolean {
+  return WATCHED_TEAMS.some(k => (team || '').includes(k))
+}
+
 export default function Leaderboard({ items, stintTracker, raceInfo, trackedTeamId, onSelectTeam, controlMessages = [] }: Props) {
   const [mode, setMode] = useState<'api' | 'real'>('api')
 
@@ -140,7 +146,8 @@ export default function Leaderboard({ items, stintTracker, raceInfo, trackedTeam
               <tr
                 key={item.id}
                 className={`border-t border-gray-700 cursor-pointer hover:bg-gray-700/50 ${
-                  isTracked ? 'bg-orange-900/30 border-l-2 border-l-orange-400' : ''
+                  isTracked ? 'bg-orange-900/30 border-l-2 border-l-orange-400'
+                    : isWatched(item.team) ? 'bg-sky-900/30 border-l-2 border-l-sky-400' : ''
                 } ${getStatusColor(item.st)}`}
                 onClick={() => onSelectTeam(String(item.id))}
               >
@@ -164,6 +171,9 @@ export default function Leaderboard({ items, stintTracker, raceInfo, trackedTeam
                 </td>
                 <td className="px-1.5 sm:px-2 py-1 sm:py-1.5 font-semibold truncate max-w-[80px] sm:max-w-[120px]">
                   <span className="inline-flex items-center gap-1">
+                    {isWatched(item.team) && (
+                      <span className="text-[10px] font-bold px-1 py-0.5 rounded bg-sky-500 text-white shrink-0">关注</span>
+                    )}
                     {item.team}
                     {penaltyMap[item.carNo] && (
                       <span className="text-[10px] text-red-400" title={`${penaltyMap[item.carNo]}张罚单`}>

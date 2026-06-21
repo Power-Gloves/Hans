@@ -224,9 +224,9 @@ function App() {
               </div>
             )}
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4">
+            <div className="grid grid-cols-3 gap-3 sm:gap-4">
               {/* Left: Leaderboard */}
-              <div className="lg:col-span-2 order-2 lg:order-1">
+              <div className="col-span-2">
                 <Leaderboard
                   items={items}
                   stintTracker={stintTracker}
@@ -238,7 +238,7 @@ function App() {
               </div>
 
               {/* Right: Strategy Panel — 仅真实数据 */}
-              <div className="space-y-3 sm:space-y-4 order-1 lg:order-2 lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto">
+              <div className="space-y-3 sm:space-y-4 lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto">
                 {trackedTeamId && items.find(i => String(i.id) === trackedTeamId) && (
                   <StintPanel
                     teamItem={items.find(i => String(i.id) === trackedTeamId)}
